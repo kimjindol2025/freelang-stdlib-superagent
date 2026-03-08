@@ -1,0 +1,549 @@
+/**
+ * FreeLang stdlib — superagent
+ *
+ * npm superagent 완전 대체 구현 (외부 npm 0개)
+ * 체이닝 스타일 HTTP 클라이언트
+ *
+ * 네이티브 레이어: src/stdlib-axios.ts 공유
+ *   axios_get / axios_post / axios_put / axios_delete
+ *   axios_patch / axios_head / axios_request
+ *
+ * 사용 예시:
+ *   import "stdlib/superagent"
+ *
+ *   // GET 체이닝
+ *   let req = get("https://api.example.com/users")
+ *   let req = set(req, "Authorization", "Bearer " + token)
+ *   let req = query(req, { page: 1, limit: 10 })
+ *   let req = setTimeout(req, 5000)
+ *   let res = execute(req)
+ *   println(res.body)
+ *   println(res.status)  // 200
+ *   println(res.ok)      // true
+ *
+ *   // POST JSON
+ *   let req2 = post("/users")
+ *   let req2 = setType(req2, "json")
+ *   let req2 = send(req2, { name: "홍길동", email: "hong@example.com" })
+ *   let res2 = execute(req2)
+ *
+ *   // Basic Auth
+ *   let req3 = get("/secure")
+ *   let req3 = auth(req3, "admin", "password")
+ *   let res3 = execute(req3)
+ *
+ *   // 콜백 스타일 (end)
+ *   let req4 = del("/users/42")
+ *   end(req4, fn(res: SAResponse) {
+ *     if res.ok {
+ *       println("삭제 완료")
+ *     }
+ *   })
+ *
+ *   // 재시도
+ *   let req5 = get("/flaky-endpoint")
+ *   let req5 = setRetry(req5, 3)
+ *   let res5 = execute(req5)
+ *
+ * Content-Type 별칭:
+ *   "json"  → application/json
+ *   "form"  → application/x-www-form-urlencoded
+ *   "xml"   → application/xml
+ *   "text"  → text/plain
+ *
+ * Accept 별칭:
+ *   "json"  → application/json
+ *   "text"  → text/plain
+ *   "html"  → text/html
+ */
+
+// ============================================
+// Struct 정의
+// ============================================
+
+struct SARequest {
+  method:        string,
+  url:           string,
+  headers:       any,
+  params:        any,
+  body:          any,
+  timeout_ms:    int,
+  retry_n:       int,
+  user:          string,
+  pass:          string,
+  max_redirects: int,
+  content_type:  string,
+  accept_type:   string
+}
+
+struct SAResponse {
+  status:  int,
+  headers: any,
+  body:    any,
+  text:    string,
+  ok:      bool
+}
+
+// ============================================
+// 내부 헬퍼: Content-Type 매핑
+// ============================================
+
+fn _resolveContentType(alias: string) -> string {
+  if alias == "json" {
+    return "application/json"
+  }
+  if alias == "form" {
+    return "application/x-www-form-urlencoded"
+  }
+  if alias == "xml" {
+    return "application/xml"
+  }
+  if alias == "text" {
+    return "text/plain"
+  }
+  if alias == "html" {
+    return "text/html"
+  }
+  // 이미 MIME 타입 형태면 그대로
+  return alias
+}
+
+// Accept 헤더 매핑
+fn _resolveAccept(alias: string) -> string {
+  if alias == "json" {
+    return "application/json"
+  }
+  if alias == "text" {
+    return "text/plain"
+  }
+  if alias == "html" {
+    return "text/html"
+  }
+  return alias
+}
+
+// ============================================
+// 내부 헬퍼: 쿼리 스트링 생성
+// ============================================
+
+fn _buildQueryString(params: any) -> string {
+  if params == null {
+    return ""
+  }
+  let keys = map.keys(params)
+  if arr.length(keys) == 0 {
+    return ""
+  }
+  let parts = []
+  let i = 0
+  while i < arr.length(keys) {
+    let k = keys[i]
+    let v = params[k]
+    arr.push(parts, str(k) + "=" + str(v))
+    i = i + 1
+  }
+  return "?" + arr.join(parts, "&")
+}
+
+// 폼 인코딩 body 생성
+fn _buildFormBody(data: any) -> string {
+  if data == null {
+    return ""
+  }
+  if typeof(data) == "string" {
+    return data
+  }
+  let keys = map.keys(data)
+  if arr.length(keys) == 0 {
+    return ""
+  }
+  let parts = []
+  let i = 0
+  while i < arr.length(keys) {
+    let k = keys[i]
+    let v = data[k]
+    arr.push(parts, str(k) + "=" + str(v))
+    i = i + 1
+  }
+  return arr.join(parts, "&")
+}
+
+// ============================================
+// 내부 헬퍼: SAResponse 생성
+// ============================================
+
+fn _makeResponse(raw: any) -> SAResponse {
+  if raw == null {
+    return SAResponse {
+      status:  0,
+      headers: {},
+      body:    null,
+      text:    "",
+      ok:      false
+    }
+  }
+  let status = raw.status
+  let ok = status >= 200 && status < 300
+  let bodyVal = raw.data
+  let textVal = ""
+  if typeof(bodyVal) == "string" {
+    textVal = bodyVal
+  }
+  return SAResponse {
+    status:  status,
+    headers: raw.headers,
+    body:    bodyVal,
+    text:    textVal,
+    ok:      ok
+  }
+}
+
+// ============================================
+// 빌더: 초기 요청 생성
+// ============================================
+
+// request(method, url) → SARequest
+fn request(method: string, url: string) -> SARequest {
+  return SARequest {
+    method:        method,
+    url:           url,
+    headers:       {},
+    params:        null,
+    body:          null,
+    timeout_ms:    5000,
+    retry_n:       0,
+    user:          "",
+    pass:          "",
+    max_redirects: 5,
+    content_type:  "application/json",
+    accept_type:   "application/json"
+  }
+}
+
+// 메서드 단축 함수
+fn get(url: string) -> SARequest {
+  return request("GET", url)
+}
+
+fn post(url: string) -> SARequest {
+  return request("POST", url)
+}
+
+fn put(url: string) -> SARequest {
+  return request("PUT", url)
+}
+
+fn del(url: string) -> SARequest {
+  return request("DELETE", url)
+}
+
+fn patch(url: string) -> SARequest {
+  return request("PATCH", url)
+}
+
+fn head(url: string) -> SARequest {
+  return request("HEAD", url)
+}
+
+// ============================================
+// 빌더: 체이닝 함수 (각각 SARequest 반환)
+// ============================================
+
+// .set(header, value) — 단일 헤더 설정
+fn set(req: SARequest, header: string, value: string) -> SARequest {
+  req.headers[header] = value
+  return req
+}
+
+// .setHeaders(headers) — 헤더 맵 일괄 설정
+fn setHeaders(req: SARequest, headers: any) -> SARequest {
+  let keys = map.keys(headers)
+  let i = 0
+  while i < arr.length(keys) {
+    let k = keys[i]
+    req.headers[k] = headers[k]
+    i = i + 1
+  }
+  return req
+}
+
+// .query(params) — 쿼리 파라미터
+fn query(req: SARequest, params: any) -> SARequest {
+  req.params = params
+  return req
+}
+
+// .send(data) — 요청 바디
+fn send(req: SARequest, data: any) -> SARequest {
+  req.body = data
+  return req
+}
+
+// .type(alias) — Content-Type 설정
+fn setType(req: SARequest, alias: string) -> SARequest {
+  let ct = _resolveContentType(alias)
+  req.content_type = ct
+  req.headers["Content-Type"] = ct
+  return req
+}
+
+// .accept(alias) — Accept 헤더 설정
+fn setAccept(req: SARequest, alias: string) -> SARequest {
+  let ac = _resolveAccept(alias)
+  req.accept_type = ac
+  req.headers["Accept"] = ac
+  return req
+}
+
+// .timeout(ms) — 타임아웃 설정
+fn setTimeout(req: SARequest, ms: int) -> SARequest {
+  req.timeout_ms = ms
+  return req
+}
+
+// .retry(n) — 재시도 횟수
+fn setRetry(req: SARequest, n: int) -> SARequest {
+  req.retry_n = n
+  return req
+}
+
+// .auth(user, pass) — Basic 인증
+fn auth(req: SARequest, user: string, pass: string) -> SARequest {
+  req.user = user
+  req.pass = pass
+  let credentials = base64_encode(user + ":" + pass)
+  req.headers["Authorization"] = "Basic " + credentials
+  return req
+}
+
+// .redirects(n) — 최대 리디렉션 횟수
+fn setRedirects(req: SARequest, n: int) -> SARequest {
+  req.max_redirects = n
+  return req
+}
+
+// ============================================
+// 내부: 단일 HTTP 실행 (재시도 없이)
+// ============================================
+
+fn _executeOnce(req: SARequest) -> SAResponse {
+  let method = req.method
+
+  // 쿼리 스트링 URL에 추가
+  let url = req.url
+  if req.params != null {
+    let qs = _buildQueryString(req.params)
+    if qs != "" {
+      url = url + qs
+    }
+  }
+
+  // 헤더에 Content-Type 반영 (미설정 시 기본값)
+  let headers = req.headers
+  if headers["Content-Type"] == null {
+    headers["Content-Type"] = req.content_type
+  }
+  if headers["Accept"] == null {
+    headers["Accept"] = req.accept_type
+  }
+
+  let headersJson = json_stringify(headers)
+  let timeout     = req.timeout_ms
+
+  // body 직렬화
+  let bodyJson = ""
+  if req.body != null {
+    if req.content_type == "application/x-www-form-urlencoded" {
+      bodyJson = _buildFormBody(req.body)
+    } else {
+      if typeof(req.body) == "string" {
+        bodyJson = req.body
+      } else {
+        bodyJson = json_stringify(req.body)
+      }
+    }
+  }
+
+  let raw = null
+
+  if method == "GET" {
+    raw = axios_get(url, headersJson, timeout)
+  } else {
+    if method == "POST" {
+      raw = axios_post(url, bodyJson, headersJson, timeout)
+    } else {
+      if method == "PUT" {
+        raw = axios_put(url, bodyJson, headersJson, timeout)
+      } else {
+        if method == "DELETE" {
+          raw = axios_delete(url, headersJson, timeout)
+        } else {
+          if method == "PATCH" {
+            raw = axios_patch(url, bodyJson, headersJson, timeout)
+          } else {
+            if method == "HEAD" {
+              raw = axios_head(url, headersJson, timeout)
+            } else {
+              // 범용 axios_request 사용
+              let config = {
+                method:  method,
+                url:     url,
+                data:    bodyJson,
+                headers: headers,
+                timeout: timeout
+              }
+              raw = axios_request(json_stringify(config))
+            }
+          }
+        }
+      }
+    }
+  }
+
+  return _makeResponse(raw)
+}
+
+// ============================================
+// execute — 재시도 포함 최종 실행
+// ============================================
+
+fn execute(req: SARequest) -> SAResponse {
+  let attempts = req.retry_n + 1
+  let last     = SAResponse {
+    status:  0,
+    headers: {},
+    body:    null,
+    text:    "",
+    ok:      false
+  }
+
+  let i = 0
+  while i < attempts {
+    last = _executeOnce(req)
+    if last.ok {
+      return last
+    }
+    i = i + 1
+  }
+
+  return last
+}
+
+// ============================================
+// end(req, fn) — 콜백 스타일 실행
+// ============================================
+
+fn end(req: SARequest, callback: any) -> void {
+  let res = execute(req)
+  if typeof(callback) == "function" {
+    callback(res)
+  }
+}
+
+// ============================================
+// then(req, fn) — Promise 유사 체이닝
+// ============================================
+
+fn then(req: SARequest, onSuccess: any) -> SAResponse {
+  let res = execute(req)
+  if res.ok {
+    if typeof(onSuccess) == "function" {
+      onSuccess(res)
+    }
+  }
+  return res
+}
+
+// then + catch 패턴
+fn thenCatch(req: SARequest, onSuccess: any, onError: any) -> SAResponse {
+  let res = execute(req)
+  if res.ok {
+    if typeof(onSuccess) == "function" {
+      onSuccess(res)
+    }
+  } else {
+    if typeof(onError) == "function" {
+      onError(res)
+    }
+  }
+  return res
+}
+
+// ============================================
+// 유틸
+// ============================================
+
+// 응답 성공 여부
+fn isOk(res: SAResponse) -> bool {
+  return res.ok
+}
+
+// 응답 상태 코드 확인
+fn isStatus(res: SAResponse, code: int) -> bool {
+  return res.status == code
+}
+
+// 응답 본문을 텍스트로
+fn getText(res: SAResponse) -> string {
+  if res.text != "" {
+    return res.text
+  }
+  if res.body != null {
+    return str(res.body)
+  }
+  return ""
+}
+
+// 헤더 값 조회
+fn getHeader(res: SAResponse, name: string) -> string {
+  if res.headers == null {
+    return ""
+  }
+  let val = res.headers[name]
+  if val == null {
+    return ""
+  }
+  return str(val)
+}
+
+// ============================================
+// Export
+// ============================================
+
+export {
+  SARequest,
+  SAResponse,
+
+  // 요청 생성
+  request,
+  get,
+  post,
+  put,
+  del,
+  patch,
+  head,
+
+  // 체이닝 빌더
+  set,
+  setHeaders,
+  query,
+  send,
+  setType,
+  setAccept,
+  setTimeout,
+  setRetry,
+  auth,
+  setRedirects,
+
+  // 실행
+  execute,
+  end,
+  then,
+  thenCatch,
+
+  // 유틸
+  isOk,
+  isStatus,
+  getText,
+  getHeader
+}
